@@ -34,31 +34,24 @@ classDiagram
     class ObjectStore {
         -File log
         -u64 write_offset
-        -HashMap~String, ValueLoc~ index
+        -HashMap index
         +open(dir) ObjectStore
         +put(bucket, key, value) Result
-        +get(bucket, key) Result~Option~
+        +get(bucket, key) Result
         +delete(bucket, key) Result
     }
     class ValueLoc {
-        <<Copy>>
         +u64 offset
         +u32 size
     }
-    note for ValueLoc "値がログのどこにあるか。<br/>offset に飛んで size バイト読めば値"
-    ObjectStore o-- "index の値" ValueLoc
-
-    class replay_log {
-        <<free fn>>
-        ログを走査し (index, write_offset) を復元
-    }
-    class compose_key {
-        <<free fn>>
-        bucket と key を \0 区切りで連結
-    }
-    ObjectStore ..> replay_log : open で使用
-    ObjectStore ..> compose_key : put/get/delete で使用
+    note for ValueLoc "値がログのどこにあるか。offset に飛んで size バイト読めば値。Copy な小さい値。"
+    ObjectStore o-- ValueLoc : index の値 (HashMap~String,ValueLoc~)
 ```
+
+補助の自由関数（クラスではなく関数）:
+
+- `replay_log(log)` — `open()` が使用。ログを頭から走査して `(index, write_offset)` を復元する。
+- `compose_key(bucket, key)` — `put/get/delete` が使用。bucket と key を `\0` 区切りで連結する。
 
 ---
 
@@ -88,7 +81,7 @@ sequenceDiagram
     actor C as 呼び出し側
     participant OS as ObjectStore
     participant L as ログファイル
-    participant I as index(HashMap)
+    participant I as index
 
     C->>OS: put("b", "k", "hi")
     OS->>OS: compose_key → "b\0k"
