@@ -7,9 +7,13 @@
 //! `/mnt/c` 配下を指定すると drvfs/9p のオーバーヘッドを測ってしまい、
 //! ストア本体の数字にならないので避けること。
 //!
-//! release ビジルドで測ること（debug だと最適化が効かず桁が変わる）。
+//! release ビルドで測ること（debug だと最適化が効かず桁が変わる）。
+//!
+//! 数字の読み方: M0 の `ObjectStore` は fsync しない（耐久性は非スコープ）。
+//! よって PUT のスループットは「OS のライトバックキャッシュに載せるまで」の値で、
+//! 電源断でディスクに残る保証はない。fsync ありの比較は後続マイルストーンで行う。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use homelab_s3::ObjectStore;
@@ -25,17 +29,21 @@ struct Config {
 fn main() {
     let cfg = parse_args();
 
-    // 前回の残骸を消してクリーンな状態から測る（replay 時間や既存 index を混ぜない）。
-    let _ = std::fs::remove_dir_all(&cfg.dir);
-    let mut store = ObjectStore::open(&cfg.dir).expect("failed to open store");
-
     // value は固定内容・固定長。内容は測定に影響しないので単純なパターンで埋める。
     let value = vec![0xABu8; cfg.value_size];
     // key は連番。桁を固定しておくと長さのブレが出ない。
     let keys: Vec<String> = (0..cfg.ops).map(|i| format!("key-{i:012}")).collect();
 
-    // ウォームアップ: アロケータ/ページキャッシュ/分岐予測を温める。計測には含めない。
-    warmup(&mut store, &value);
+    // ウォームアップ: アロケータ/分岐予測/CPU 周波数を温める。計測には含めない。
+    // 使い捨ての別ストアで回すことで、計測対象のストアは index も空のまま保つ
+    // （warmup のレコードが計測ストアの index に混ざらないようにする）。
+    let mut warmup_dir = cfg.dir.clone();
+    warmup_dir.as_mut_os_string().push("_warmup");
+    run_warmup(&warmup_dir, &value);
+
+    // 前回の残骸を消してクリーンな状態から測る（replay 時間や既存 index を混ぜない）。
+    let _ = std::fs::remove_dir_all(&cfg.dir);
+    let mut store = ObjectStore::open(&cfg.dir).expect("failed to open store");
 
     // --- PUT フェーズ ---
     let mut put_lat = Vec::with_capacity(cfg.ops);
@@ -66,6 +74,7 @@ fn main() {
         cfg.value_size,
         cfg.dir.display()
     );
+    println!("note: fsync なし（M0 は耐久性非スコープ）。OS ライトバックキャッシュ込みの数字。");
     report("PUT", &mut put_lat, put_elapsed, cfg.value_size);
     report("GET", &mut get_lat, get_elapsed, cfg.value_size);
 
@@ -73,14 +82,19 @@ fn main() {
     let _ = std::fs::remove_dir_all(&cfg.dir);
 }
 
-/// 計測に入る前に少しだけ回して各種キャッシュを温める。
-fn warmup(store: &mut ObjectStore, value: &[u8]) {
+/// 計測に入る前に、使い捨てストアで少しだけ回して各種キャッシュを温める。
+/// 計測対象ストアには一切触れないので、そちらの index はクリーンなまま。
+fn run_warmup(dir: &Path, value: &[u8]) {
     const WARMUP_OPS: usize = 1_000;
+    let _ = std::fs::remove_dir_all(dir);
+    let mut store = ObjectStore::open(dir).expect("warmup open failed");
     for i in 0..WARMUP_OPS {
         let k = format!("warmup-{i}");
         store.put("warmup", &k, value).expect("warmup put failed");
         std::hint::black_box(store.get("warmup", &k).expect("warmup get failed"));
     }
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// 1フェーズ分の結果を表で出す。`lat` は要約時にソートされるので `&mut`。
@@ -145,6 +159,10 @@ fn parse_args() -> Config {
 
     if ops == 0 {
         eprintln!("--ops must be >= 1");
+        std::process::exit(2);
+    }
+    if value_size == 0 {
+        eprintln!("--value-size must be >= 1");
         std::process::exit(2);
     }
 
