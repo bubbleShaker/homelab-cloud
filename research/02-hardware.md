@@ -55,8 +55,9 @@ M2「自宅ネットワーク構築」に入る前に、物理ノードとして
 
 - **候補**: Beelink Mini S12 Pro（N100 / 16GB DDR4 / 500GB NVMe）または Beelink EQ13（N200 / **デュアル 2.5GbE**、分散のネットワーク計測に有利）。
 - **概算**: S12 Pro 約 25,000〜28,000円、EQ13 約 33,000円前後。RAM・SSD・電源・ケース込みの完成品。
-- **購入先**: Amazon.co.jp（Beelink 公式ストア）。
-  - S12 Pro 参考: <https://www.amazon.com/dp/B0BVFS94J5>
+- **購入先**: Amazon.co.jp（Beelink 公式ストア）。※型番で検索して国内在庫を確認する。
+  - S12 Pro 参考（国内検索）: <https://www.amazon.co.jp/s?k=Beelink+Mini+S12+Pro+N100+16GB>
+  - スペック参照（米 Amazon の型番ページ）: <https://www.amazon.com/dp/B0BVFS94J5>
 - **採らない理由**: 総額が Pi 5 とほぼ同じなのに「制約」が薄く、x86 で開発機と地続き＝**学びの新規性が低い**。
   ただし「M4 の分散で 2.5GbE の帯域を数字で見たい」を優先するなら EQ13 は合理的。将来 1 台だけ混ぜる選択肢として保留。
 
