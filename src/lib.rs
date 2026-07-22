@@ -13,6 +13,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+/// 計測ロジック（レイテンシ分布・スループット）。M1 のベンチが使う。
+pub mod metrics;
+
 /// ログ内の1レコードのヘッダ長。
 /// flags(1) + key_len(4) + value_len(4) = 9 バイト固定。
 /// 固定長にしておくと、offset 計算が足し算だけで済む。
