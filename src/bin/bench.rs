@@ -17,13 +17,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use homelab_s3::ObjectStore;
+use homelab_s3::client::S3Client;
 use homelab_s3::metrics::{LatencySummary, throughput};
+
+const WARMUP_OPS: usize = 1_000;
 
 /// ベンチのパラメータ。CLI 引数から作る。
 struct Config {
     ops: usize,
     value_size: usize,
     dir: PathBuf,
+    /// Some のとき HTTP モード。値は接続先 "host:port"。
+    /// None のときはプロセス内で `ObjectStore` を直叩きする従来モード。
+    url: Option<String>,
 }
 
 fn main() {
@@ -34,58 +40,86 @@ fn main() {
     // key は連番。桁を固定しておくと長さのブレが出ない。
     let keys: Vec<String> = (0..cfg.ops).map(|i| format!("key-{i:012}")).collect();
 
-    // ウォームアップ: アロケータ/分岐予測/CPU 周波数を温める。計測には含めない。
-    // 使い捨ての別ストアで回すことで、計測対象のストアは index も空のまま保つ
-    // （warmup のレコードが計測ストアの index に混ざらないようにする）。
+    // モードで計測経路が分かれる。どちらも measure_phase で計測ロジックを共有する。
+    let (mut put_lat, put_elapsed, mut get_lat, get_elapsed) = match &cfg.url {
+        Some(url) => run_http(url, &keys, &value),
+        None => run_local(&cfg, &keys, &value),
+    };
+
+    match &cfg.url {
+        Some(url) => println!("config: ops={} value_size={}B mode=HTTP url={url}", cfg.ops, cfg.value_size),
+        None => println!(
+            "config: ops={} value_size={}B mode=local dir={}",
+            cfg.ops,
+            cfg.value_size,
+            cfg.dir.display()
+        ),
+    }
+    println!("note: fsync なし（M0 は耐久性非スコープ）。OS ライトバックキャッシュ込みの数字。");
+    report("PUT", &mut put_lat, put_elapsed, cfg.value_size);
+    report("GET", &mut get_lat, get_elapsed, cfg.value_size);
+}
+
+/// 1フェーズを計測する。`op(i)` が key index i の操作を1回行い、その所要時間だけを測る。
+/// 計測対象は op の中身だけ（ループ制御や採番のコストは含めない）。
+fn measure_phase<F: FnMut(usize)>(ops: usize, mut op: F) -> (Vec<Duration>, Duration) {
+    let mut lat = Vec::with_capacity(ops);
+    let start = Instant::now();
+    for i in 0..ops {
+        let t = Instant::now();
+        op(i);
+        lat.push(t.elapsed());
+    }
+    (lat, start.elapsed())
+}
+
+/// 従来モード: プロセス内の `ObjectStore` を直叩きして PUT/GET を測る。
+fn run_local(cfg: &Config, keys: &[String], value: &[u8]) -> (Vec<Duration>, Duration, Vec<Duration>, Duration) {
+    // ウォームアップは使い捨ての別ストアで。計測対象の index はクリーンに保つ。
     let mut warmup_dir = cfg.dir.clone();
     warmup_dir.as_mut_os_string().push("_warmup");
-    run_warmup(&warmup_dir, &value);
+    warmup_local(&warmup_dir, value);
 
     // 前回の残骸を消してクリーンな状態から測る（replay 時間や既存 index を混ぜない）。
     let _ = std::fs::remove_dir_all(&cfg.dir);
     let mut store = ObjectStore::open(&cfg.dir).expect("failed to open store");
 
-    // --- PUT フェーズ ---
-    let mut put_lat = Vec::with_capacity(cfg.ops);
-    let put_start = Instant::now();
-    for k in &keys {
-        let t = Instant::now();
-        store.put("bench", k, &value).expect("put failed");
-        put_lat.push(t.elapsed());
-    }
-    let put_elapsed = put_start.elapsed();
-
-    // --- GET フェーズ ---
+    let (put_lat, put_elapsed) =
+        measure_phase(cfg.ops, |i| store.put("bench", &keys[i], value).expect("put failed"));
     // 直前に書いた全 key を読む。存在する key なので index ヒット→1 seek のパスを測る。
-    let mut get_lat = Vec::with_capacity(cfg.ops);
-    let get_start = Instant::now();
-    for k in &keys {
-        let t = Instant::now();
-        let got = store.get("bench", k).expect("get failed");
+    let (get_lat, get_elapsed) = measure_phase(cfg.ops, |i| {
         // black_box: 戻り値を「使った」ことにして、最適化で GET 自体が消えるのを防ぐ。
-        std::hint::black_box(got);
-        get_lat.push(t.elapsed());
-    }
-    let get_elapsed = get_start.elapsed();
-
-    println!(
-        "config: ops={} value_size={}B dir={}",
-        cfg.ops,
-        cfg.value_size,
-        cfg.dir.display()
-    );
-    println!("note: fsync なし（M0 は耐久性非スコープ）。OS ライトバックキャッシュ込みの数字。");
-    report("PUT", &mut put_lat, put_elapsed, cfg.value_size);
-    report("GET", &mut get_lat, get_elapsed, cfg.value_size);
+        std::hint::black_box(store.get("bench", &keys[i]).expect("get failed"));
+    });
 
     // 後始末。ベンチ用データは残さない。
+    drop(store);
     let _ = std::fs::remove_dir_all(&cfg.dir);
+    (put_lat, put_elapsed, get_lat, get_elapsed)
 }
 
-/// 計測に入る前に、使い捨てストアで少しだけ回して各種キャッシュを温める。
+/// HTTP モード: 起動済みサーバへ LAN/localhost 越しに PUT/GET を測る。
+/// データディレクトリはサーバが持つので、こちらは掃除しない。
+fn run_http(url: &str, keys: &[String], value: &[u8]) -> (Vec<Duration>, Duration, Vec<Duration>, Duration) {
+    let client = S3Client::new(url);
+    // ウォームアップ: TCP/アロケータ/サーバ側キャッシュを温める。warmup バケットに書く。
+    for i in 0..WARMUP_OPS {
+        let k = format!("warmup-{i}");
+        client.put("warmup", &k, value).expect("warmup put failed");
+        std::hint::black_box(client.get("warmup", &k).expect("warmup get failed"));
+    }
+
+    let (put_lat, put_elapsed) =
+        measure_phase(keys.len(), |i| client.put("bench", &keys[i], value).expect("put failed"));
+    let (get_lat, get_elapsed) = measure_phase(keys.len(), |i| {
+        std::hint::black_box(client.get("bench", &keys[i]).expect("get failed"));
+    });
+    (put_lat, put_elapsed, get_lat, get_elapsed)
+}
+
+/// 計測に入る前に、使い捨てストアで少しだけ回して各種キャッシュを温める（local モード用）。
 /// 計測対象ストアには一切触れないので、そちらの index はクリーンなまま。
-fn run_warmup(dir: &Path, value: &[u8]) {
-    const WARMUP_OPS: usize = 1_000;
+fn warmup_local(dir: &Path, value: &[u8]) {
     let _ = std::fs::remove_dir_all(dir);
     let mut store = ObjectStore::open(dir).expect("warmup open failed");
     for i in 0..WARMUP_OPS {
@@ -136,6 +170,7 @@ fn parse_args() -> Config {
     let mut ops: usize = 100_000;
     let mut value_size: usize = 256;
     let mut dir = std::env::temp_dir().join("homelab_s3_bench");
+    let mut url: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -144,6 +179,9 @@ fn parse_args() -> Config {
             "--value-size" => value_size = parse_next(&mut args, "--value-size"),
             "--dir" => {
                 dir = PathBuf::from(next_arg(&mut args, "--dir"));
+            }
+            "--url" => {
+                url = Some(next_arg(&mut args, "--url"));
             }
             "-h" | "--help" => {
                 print_help();
@@ -170,6 +208,7 @@ fn parse_args() -> Config {
         ops,
         value_size,
         dir,
+        url,
     }
 }
 
@@ -204,8 +243,10 @@ fn print_help() {
          OPTIONS:\n  \
          --ops N            計測する PUT/GET の回数 (default: 100000)\n  \
          --value-size BYTES 1オブジェクトの value サイズ (default: 256)\n  \
-         --dir PATH         データディレクトリ (default: <tmp>/homelab_s3_bench)\n  \
+         --dir PATH         データディレクトリ (local モード時, default: <tmp>/homelab_s3_bench)\n  \
+         --url HOST:PORT    指定すると HTTP モード。起動済み server へ LAN/localhost 越しに測る\n  \
          -h, --help         この使い方を表示\n\n\
-         NOTE: --dir に /mnt/c 配下を指定すると drvfs のオーバーヘッドを測るので避ける。"
+         NOTE: --dir に /mnt/c 配下を指定すると drvfs のオーバーヘッドを測るので避ける。\n  \
+         NOTE: --url 指定時は --dir を無視し、データはサーバ側に残る（掃除しない）。"
     );
 }

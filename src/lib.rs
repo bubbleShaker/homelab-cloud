@@ -19,6 +19,9 @@ pub mod metrics;
 /// 依存ゼロの最小 HTTP パーサ/レスポンダ。M3 の server バイナリが使う。
 pub mod http;
 
+/// S3-over-HTTP の最小クライアント。ベンチや LAN 疎通確認が使う。
+pub mod client;
+
 /// ログ内の1レコードのヘッダ長。
 /// flags(1) + key_len(4) + value_len(4) = 9 バイト固定。
 /// 固定長にしておくと、offset 計算が足し算だけで済む。
