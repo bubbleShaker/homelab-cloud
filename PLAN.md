@@ -64,7 +64,7 @@ graph TD
 - [x] 実装言語の確定 → **Rust**
 - [x] M0 のスコープ確定 → Issue 化（#1 / PR #2）
 - [x] ハード構成の確定 → **Raspberry Pi 5 8GB / NVMe ブート / まず1台 → M4 で2台**（`research/02-hardware.md`）。ミニPCは対抗馬どまり
-- [ ] HTTP/S3 API 化のタイミング（M3 の LAN アクセスと合わせるか）
+- [x] HTTP/S3 API 化のタイミング → **ハード着荷を待たずソフト先行で実装済み**（#14 / PR #15）。`src/http.rs` + `src/bin/server.rs`
 - [ ] 発注構成の最終確定（NVMe 容量 256 or 512GB / RAM 8 or 16GB は 2026 値上げ幅を見て判断）
 - [ ] 自宅サブネット/GW の実値確認（`research/03` は `192.168.10.0/24` を仮採番）
 
@@ -72,7 +72,9 @@ graph TD
 
 **完了済み**: M0（自作S3コア, #1/#2）、M1（計測基盤, #6/#7）。概要は `summary/01-m0.md` / `summary/02-m1.md`。
 **M2 の机上調査は完了**: `research/02-hardware.md`（買うハード確定）/ `research/03-os-network.md`（OS・IP・名前解決・疎通設計）。
-現状 `main` は clean。実装は `src/lib.rs`（ObjectStore）、`src/metrics.rs`、`src/bin/bench.rs`。
+**M3 のソフト先行分（HTTP 化）完了**: 自作S3コアを HTTP/S3 最小サブセット（PUT/GET/DELETE）で叩ける常駐サーバを実装（#14 / PR #15）。依存ゼロ自作 HTTP、1接続1スレッド + `Mutex<ObjectStore>`。reviewer 指摘（ヘッダ上限・IO タイムアウト・poison 回復・smuggling/traversal 防御）解消済み。
+現状 `main` は clean。実装は `src/lib.rs`（ObjectStore）、`src/metrics.rs`、`src/http.rs`（HTTP パーサ）、`src/bin/bench.rs`、`src/bin/server.rs`（常駐サーバ）。
+起動: `cargo run --bin server -- [DATA_DIR] [BIND_ADDR]`（既定 `./data` / `127.0.0.1:8080`）。
 
 **M2「自宅ネットワーク構築」の確定事項（research 02/03）**:
 
@@ -82,12 +84,13 @@ graph TD
 - ネットワーク: **ルータ DHCP 予約**で固定IP（`hlc-node1=.11`）、名前解決は **mDNS(`.local`) + `/etc/hosts` 併記**。
 - M2 完了条件は `research/03` の「疎通確認チェックリスト」を満たすこと。
 
-**次の一歩 = 実機発注 → M3「物理デプロイ」**（ここからソフト実装＋物理）:
+**次の一歩 = 実機発注 → M3「物理デプロイ」の物理部分**（ソフトの HTTP 化は完了済み）:
 
-1. 発注構成の最終確定（未決事項の NVMe 容量 / RAM）→ スイッチサイエンス or KSY で発注。
+1. 発注構成の最終確定（未決事項の NVMe 容量 / RAM）→ スイッチサイエンス or KSY で発注。**※現実アクションなのでユーザーが実施**。
 2. 着荷後、`research/03` の手順で OS 導入・NVMe ブート・疎通確認（M2 の物理部分をクローズ）。
-3. M3: `hlc-node1` に Rust ツールチェーン → M0 の自作S3をビルド・常駐 → **HTTP 化**して LAN 越し `PUT`/`GET`。
-   M1 ベンチを**開発機から LAN 越しに**回し、ローカル計測との差（往復・NVMe 実I/O）を取り直す。
+3. M3: `hlc-node1` に Rust ツールチェーン → 本リポジトリをビルド → `cargo run --bin server -- <data_dir> 0.0.0.0:8080` で常駐 → LAN 越し `PUT`/`GET`/`DELETE`。
+   M1 ベンチ（または HTTP クライアント）を**開発機から LAN 越しに**回し、ローカル計測との差（往復・NVMe 実I/O）を取り直す。
+   - 次のソフト課題候補: ベンチを HTTP 経由に対応させる / `fsync` 耐久性 / log compaction（M5 の入口）。着荷を待たずに着手可。
 
 **再開時の運用**: 文脈はこの PLAN.md と `research/02`・`03` / `summary/` に残っている前提で、新しいセッションを切って始める。
 着手前にアプローチを提案し、Issue 先行（起票 → ブランチ実装 → reviewer レビュー → PR → マージ、main 直 push 不可）で進める。
