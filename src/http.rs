@@ -37,6 +37,15 @@ pub struct Target {
     pub key: String,
 }
 
+/// レスポンスの「頭」= ステータスライン + ヘッダの解釈結果。クライアントが使う。
+/// body 本体はここには含めない（Content-Length 分をクライアントが後から読む）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseHead {
+    pub status: u16,
+    /// body のバイト数。ヘッダに無ければ 0。
+    pub content_length: usize,
+}
+
 /// パース失敗の理由。サーバはこれを 4xx/5xx にマッピングする。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
@@ -179,6 +188,75 @@ pub fn build_response(status: u16, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// クライアント側: リクエストをバイト列に組み立てる。`build_response` と対称。
+///
+/// メソッド行 + Host + Content-Length + `Connection: close` + 空行 + body。
+/// サーバが1接続1リクエストなので毎回 close を宣言する（keep-alive はしない）。
+/// Host はダミー（"homelab-s3"）でよい——本サーバは Host を見ないため。
+pub fn build_request(method: Method, path: &str, body: &[u8]) -> Vec<u8> {
+    let method_str = match method {
+        Method::Put => "PUT",
+        Method::Get => "GET",
+        Method::Delete => "DELETE",
+    };
+    let mut out = Vec::with_capacity(64 + path.len() + body.len());
+    out.extend_from_slice(
+        format!(
+            "{method_str} {path} HTTP/1.1\r\n\
+             Host: homelab-s3\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(body);
+    out
+}
+
+/// クライアント側: レスポンスの頭（ステータスライン + ヘッダ）をパースする。
+/// `parse_head` のレスポンス版。ステータスコードと Content-Length を取り出す。
+///
+/// リクエスト側（`parse_head`）にある重複 Content-Length 拒否 / Transfer-Encoding 拒否は
+/// ここには入れない。相手は自作サーバ（`build_response` が単一 Content-Length を必ず出す）で
+/// smuggling の脅威が無いため、あえて緩くして計測経路を単純に保つ。
+pub fn parse_response_head(head: &str) -> Result<ResponseHead, ParseError> {
+    // 行区切りは LF、末尾 CR を落とす（parse_head と同じ規則）。
+    let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+
+    // 1行目 = ステータスライン。"HTTP/1.1 SP CODE SP REASON"。
+    let status_line = lines.next().ok_or(ParseError::MalformedRequestLine)?;
+    let mut parts = status_line.split(' ');
+    // 1つ目は "HTTP/1.1"。存在確認だけする。
+    parts.next().ok_or(ParseError::MalformedRequestLine)?;
+    let status = parts
+        .next()
+        .ok_or(ParseError::MalformedRequestLine)?
+        .parse::<u16>()
+        .map_err(|_| ParseError::MalformedRequestLine)?;
+
+    let mut content_length = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| ParseError::InvalidContentLength)?;
+            }
+        }
+    }
+
+    Ok(ResponseHead {
+        status,
+        content_length,
+    })
+}
+
 /// 使うステータスコードの reason phrase。未知コードは "OK" 扱いにしない安全側で "Status"。
 fn reason_phrase(status: u16) -> &'static str {
     match status {
@@ -316,5 +394,46 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert!(text.contains("Content-Length: 0\r\n"));
+    }
+
+    #[test]
+    fn build_request_put_carries_body_and_length() {
+        let bytes = build_request(Method::Put, "/b/k", b"hi");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("PUT /b/k HTTP/1.1\r\n"));
+        assert!(text.contains("Content-Length: 2\r\n"));
+        assert!(text.ends_with("\r\n\r\nhi"));
+    }
+
+    #[test]
+    fn build_request_roundtrips_through_parse_head() {
+        // build_request が吐いた頭を parse_head が読めること（対称性）。
+        let bytes = build_request(Method::Get, "/photos/cat.jpg", b"");
+        let text = String::from_utf8(bytes).unwrap();
+        let head = text.split("\r\n\r\n").next().unwrap();
+        let got = parse_head(head).unwrap();
+        assert_eq!(got.method, Method::Get);
+        assert_eq!(got.path, "/photos/cat.jpg");
+        assert_eq!(got.content_length, 0);
+    }
+
+    #[test]
+    fn parse_response_head_extracts_status_and_length() {
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n";
+        let got = parse_response_head(head).unwrap();
+        assert_eq!(got.status, 200);
+        assert_eq!(got.content_length, 11);
+    }
+
+    #[test]
+    fn parse_response_head_404_has_length() {
+        let head = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\n";
+        let got = parse_response_head(head).unwrap();
+        assert_eq!(got.status, 404);
+    }
+
+    #[test]
+    fn parse_response_head_rejects_garbage_status() {
+        assert!(parse_response_head("garbage\r\n\r\n").is_err());
     }
 }
