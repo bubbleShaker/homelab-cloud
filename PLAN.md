@@ -73,8 +73,10 @@ graph TD
 **完了済み**: M0（自作S3コア, #1/#2）、M1（計測基盤, #6/#7）。概要は `summary/01-m0.md` / `summary/02-m1.md`。
 **M2 の机上調査は完了**: `research/02-hardware.md`（買うハード確定）/ `research/03-os-network.md`（OS・IP・名前解決・疎通設計）。
 **M3 のソフト先行分（HTTP 化）完了**: 自作S3コアを HTTP/S3 最小サブセット（PUT/GET/DELETE）で叩ける常駐サーバを実装（#14 / PR #15）。依存ゼロ自作 HTTP、1接続1スレッド + `Mutex<ObjectStore>`。reviewer 指摘（ヘッダ上限・IO タイムアウト・poison 回復・smuggling/traversal 防御）解消済み。
-現状 `main` は clean。実装は `src/lib.rs`（ObjectStore）、`src/metrics.rs`、`src/http.rs`（HTTP パーサ）、`src/bin/bench.rs`、`src/bin/server.rs`（常駐サーバ）。
+**ベンチの HTTP 経由対応 完了**: `S3Client`（`src/client.rs`）を追加し、`bench --url HOST:PORT` で起動済み server 越しに PUT/GET を計測（#17 / PR #18）。localhost 実測で local 直叩き（PUT ~484k/GET ~620k req/s）と HTTP 経由（PUT ~1.7k/GET ~2.4k req/s）の 100 倍超の差 = 接続毎往復コストが数字に出ることを確認。
+現状 `main` は clean。実装は `src/lib.rs`（ObjectStore）、`src/metrics.rs`、`src/http.rs`（HTTP ワイヤ形式・双方向）、`src/client.rs`（S3Client）、`src/bin/server.rs`（常駐サーバ）、`src/bin/bench.rs`（local/HTTP 両対応ベンチ）。
 起動: `cargo run --bin server -- [DATA_DIR] [BIND_ADDR]`（既定 `./data` / `127.0.0.1:8080`）。
+計測: `cargo run --release --bin bench -- [--url HOST:PORT] [--ops N] [--value-size B]`（`--url` 省略で local 直叩き）。
 
 **M2「自宅ネットワーク構築」の確定事項（research 02/03）**:
 
@@ -89,8 +91,8 @@ graph TD
 1. 発注構成の最終確定（未決事項の NVMe 容量 / RAM）→ スイッチサイエンス or KSY で発注。**※現実アクションなのでユーザーが実施**。
 2. 着荷後、`research/03` の手順で OS 導入・NVMe ブート・疎通確認（M2 の物理部分をクローズ）。
 3. M3: `hlc-node1` に Rust ツールチェーン → 本リポジトリをビルド → `cargo run --bin server -- <data_dir> 0.0.0.0:8080` で常駐 → LAN 越し `PUT`/`GET`/`DELETE`。
-   M1 ベンチ（または HTTP クライアント）を**開発機から LAN 越しに**回し、ローカル計測との差（往復・NVMe 実I/O）を取り直す。
-   - 次のソフト課題候補: ベンチを HTTP 経由に対応させる / `fsync` 耐久性 / log compaction（M5 の入口）。着荷を待たずに着手可。
+   **開発機から `bench --url <node-ip>:8080`** を回し、localhost 計測との差（LAN 往復・NVMe 実I/O）を取り直す（HTTP 経由ベンチは実装済み）。
+   - 次のソフト課題候補（着荷を待たず着手可）: `fsync` 耐久性（PUT の耐久性 on/off を数字で比較）/ log compaction（M5 の入口）/ ベンチの並行リクエスト対応（p99 を負荷下で見る）。
 
 **再開時の運用**: 文脈はこの PLAN.md と `research/02`・`03` / `summary/` に残っている前提で、新しいセッションを切って始める。
 着手前にアプローチを提案し、Issue 先行（起票 → ブランチ実装 → reviewer レビュー → PR → マージ、main 直 push 不可）で進める。
